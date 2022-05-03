@@ -96,13 +96,6 @@ void MsgQC::postponed_parse(HotStuffCore *hsc) {
     serialized >> qc;
 }
 
-const opcode_t MsgAck::opcode;
-MsgAck::MsgAck(const Ack &ack) { serialized << ack; }
-void MsgAck::postponed_parse(HotStuffCore *hsc) {
-    ack.hsc = hsc;
-    serialized >> ack;
-}
-
 const opcode_t MsgShare::opcode;
 MsgShare::MsgShare(const Share &share) { serialized << share; }
 void MsgShare::postponed_parse(HotStuffCore *hsc) {
@@ -285,24 +278,6 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
     });
 }
 
-void HotStuffBase::ack_handler(MsgAck &&msg, const Net::conn_t &conn) {
-    const NetAddr &peer = conn->get_peer_addr();
-    if (peer.is_null()) return;
-    msg.postponed_parse(this);
-
-    RcObj<Ack> v(new Ack(std::move(msg.ack)));
-    promise::all(std::vector<promise_t>{
-            async_deliver_blk(v->blk_hash, peer),
-            v->verify(vpool),
-            async_wait_enter_view(v->view),
-    }).then([this, v=std::move(v)](const promise::values_t values) {
-        if (!promise::any_cast<bool>(values[1]))
-            LOG_WARN("invalid ack from %d", v->voter);
-        else
-            on_receive_ack(*v);
-    });
-}
-
 void HotStuffBase::share_handler(MsgShare &&msg, const Net::conn_t &conn) {
     const NetAddr &peer = conn->get_peer_addr();
     if (peer.is_null()) return;
@@ -476,6 +451,32 @@ void HotStuffBase::stop_viewtrans_timer() {
     viewtrans_timer.clear();
 }
 
+void HotStuffBase::set_view_timer(double t_sec) {
+    view_timer = TimerEvent(ec, [this](TimerEvent &) {
+        view_timer.clear();
+        on_view_timeout();
+    });
+    view_timer.add(t_sec);
+}
+
+void HotStuffBase::set_vote_timer(const block_t &blk, ReplicaID dest, double t_sec) {
+    vote_timer = TimerEvent(ec, [this, blk=std::move(blk), dest](TimerEvent &) {
+        on_vote_timer_timeout(blk, dest);
+        vote_timer.clear();
+
+    });
+    vote_timer.add(t_sec);
+}
+
+void HotStuffBase::stop_vote_timer() {}
+
+void HotStuffBase::set_qc_receive_timer(uint32_t view, double t_sec) {
+    qc_receive_timer = TimerEvent(ec, [view, this](TimerEvent &) {
+        on_qc_receive_timeout(view);
+    });
+    qc_receive_timer.add(t_sec);
+}
+
 void HotStuffBase::req_blk_handler(MsgReqBlock &&msg, const Net::conn_t &conn) {
     const NetAddr replica = conn->get_peer_addr();
     if (replica.is_null()) return;
@@ -625,7 +626,6 @@ HotStuffBase::HotStuffBase(uint32_t blk_size,
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::resp_blk_handler, this, _1, _2));
     pn.reg_conn_handler(salticidae::generic_bind(&HotStuffBase::conn_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::qc_handler, this, _1, _2));
-    pn.reg_handler(salticidae::generic_bind(&HotStuffBase::ack_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::share_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::beacon_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::echo_handler, this, _1, _2));
@@ -689,11 +689,7 @@ void HotStuffBase::start(
         LOG_WARN("too few replicas in the system to tolerate any failure");
 
     on_init(nfaulty, delta);
-
-
     pmaker->init(this);
-
-
     if (ec_loop)
         ec.dispatch();
 
