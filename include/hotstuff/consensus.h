@@ -21,6 +21,7 @@
 #include <cassert>
 #include <set>
 #include <unordered_map>
+#include <queue>
 
 #include "hotstuff/promise.hpp"
 #include "hotstuff/type.h"
@@ -50,8 +51,13 @@ struct QC;
 struct Ack;
 struct Share;
 struct Echo;
+struct Echo2;
 struct Beacon;
 struct PVSSTranscript;
+struct NewStateReq;
+struct NewStateResp;
+struct Join;
+struct JoinSuccess;
 
 /** Abstraction for HotStuff protocol state machine (without network implementation). */
 class HotStuffCore {
@@ -108,6 +114,8 @@ class HotStuffCore {
     void _deliver_cert(const quorum_cert_bt &qc);
     void _broadcast_share(uint32_t view);
     void _try_enter_view();
+    void _enter_view();
+    void _on_commit(const block_t &blk);
 
     void _update_agg_queue(uint32_t view);
 
@@ -137,6 +145,23 @@ class HotStuffCore {
     // A queue of aggregated transcripts per party
     std::unordered_map<ReplicaID, optrand_crypto::pvss_aggregate_t> agg_queue;
     std::unordered_map<uint32_t, optrand_crypto::pvss_aggregate_t> view_agg_transcripts;
+
+    std::unordered_map<uint32_t, block_t> view_blocks;
+
+//    std::unordered_set<ReplicaID> state_resp_received;
+    std::vector<optrand_crypto::pvss_sharing_t> state_resp_transcripts;
+    std::vector<size_t> state_resp_ids;
+
+    std::unordered_map<ReplicaID, optrand_crypto::pvss_aggregate_t> join_agg_transcripts;
+    std::unordered_map<ReplicaID, bool> jreq_proposed;
+    std::vector<uint32_t> proposed_join_views;
+    std::queue<ReplicaID> join_requests;
+
+    std::unordered_map<uint32_t, block_t> committed_join_requests;
+    bool join_processed;
+    uint32_t joined_view;
+    bool is_new_replica;
+    uint32_t last_joined_view;
 
 
 protected:
@@ -178,15 +203,22 @@ protected:
     void on_propose_timeout();
     void on_viewtrans_timeout();
     void on_enter_view(uint32_t view);
+    void on_view_timer_timeout();
 
     void on_receive_qc(const quorum_cert_bt &qc);
     void on_receive_ack(const Ack &ack);
     void on_receive_share(const Share &share);
     void on_receive_proposal_echo(const Echo &echo);
-    void on_receive_cert_echo(const Echo &echo);
+    void on_receive_cert_echo(const Echo2 &echo2);
     void on_receive_beacon(const Beacon &beacon);
     void on_receive_pvss_transcript(const PVSSTranscript &pvss_transcript);
+    void on_start_join();
+    void on_receive_new_state_req(const NewStateReq &newStateReq);
+    void on_receive_new_state_resp(const NewStateResp &newStatResp);
+    void on_receive_join(const Join &join);
+    void on_receive_join_success(const JoinSuccess &joinSuccess);
 
+    void _check_if_committed(uint32_t _view);
 
     /** Call to submit new commands to be decided (executed). "Parents" must
      * contain at least one block, and the first block is the actual parent,
@@ -218,6 +250,8 @@ protected:
     virtual void stop_propose_timer() = 0;
     virtual void set_viewtrans_timer(double t_sec) = 0;
     virtual void stop_viewtrans_timer() = 0;
+    virtual void set_view_timer(double t_sec) = 0;
+    virtual void stop_view_timer() = 0;
 
     virtual void do_broadcast_qc(const QC &qc) = 0;
 
@@ -229,11 +263,18 @@ protected:
     virtual void do_status(const Status &status) = 0;
     virtual void do_broadcast_echo(const Echo &echo) = 0;
     virtual void do_echo(const Echo &echo, ReplicaID dest) = 0;
-    virtual void do_broadcast_echo2(const Echo &echo) = 0;
-    virtual void do_echo2(const Echo &echo, ReplicaID dest) = 0;
+    virtual void do_broadcast_echo2(const Echo2 &echo2) = 0;
+    virtual void do_echo2(const Echo2 &echo2, ReplicaID dest) = 0;
     virtual void do_propose() = 0;
     virtual void do_send_pvss_transcript(const PVSSTranscript &pvss_transcript, ReplicaID dest) = 0;
+    virtual void do_broadcast_new_state_req(const NewStateReq &newStateReq) = 0;
+    virtual void do_send_new_state(const NewStateResp &newStateResp, ReplicaID dest) = 0;
+    virtual void do_broadcast_join(const Join &join) = 0;
+    virtual void do_send_join_success(const JoinSuccess &joinSuccess, ReplicaID dest) = 0;
 
+    virtual void delete_peer(const NetAddr &addr) = 0;
+    virtual void refresh_active_peers(const std::vector<NetAddr> &peers) = 0;
+    virtual void add_active_peer(const NetAddr &addr) = 0;
 
     virtual void schedule_propose(double t_sec) = 0;
     virtual void block_fetched(const block_t &blk, ReplicaID replicaId) = 0;
@@ -256,6 +297,8 @@ protected:
     /** Add a replica to the current configuration. This should only be called
      * before running HotStuffCore protocol. */
     void add_replica(ReplicaID rid, const NetAddr &addr, pubkey_bt &&pub_key);
+
+    void add_passive_replica(ReplicaID rid, const NetAddr &addr, pubkey_bt &&pub_key);
     /** Try to prune blocks lower than last committed height - staleness. */
     void prune(uint32_t staleness);
 
@@ -295,7 +338,8 @@ private:
 
     ReplicaID get_proposer(uint32_t _view){
         // Nibesh: Duplicate of get_proposer function in pacemaker.
-        return (_view -1) % config.nreplicas;
+        auto idx = (_view - 1) % config.nactive_replicas;
+        return  config.get_replica_id(idx);
     }
 };
 
@@ -424,29 +468,40 @@ struct Status: public Serializable {
     uint32_t view;
     quorum_cert_bt qc;
 
+    bytearray_t pvss_transcript;
+
+
     /** handle of the core object to allow polymorphism */
     HotStuffCore *hsc;
 
     Status(): qc(nullptr), hsc(nullptr) {}
     Status(ReplicaID replicaID, quorum_cert_bt &&qc,
-           uint32_t view, HotStuffCore *hsc):
-            replicaID(replicaID), qc(std::move(qc)), view(view), hsc(hsc) {}
+           uint32_t view, bytearray_t &&pvss_transcript, HotStuffCore *hsc):
+            replicaID(replicaID), qc(std::move(qc)), view(view), hsc(hsc), pvss_transcript(std::move(pvss_transcript)) {}
 
     Status(const Status &other):
-            replicaID(replicaID),
+            replicaID(other.replicaID),
             qc(other.qc ? other.qc->clone() : nullptr),
-            view(other.view),hsc(other.hsc) {}
+            view(other.view), pvss_transcript(std::move(pvss_transcript)), hsc(other.hsc) {}
 
     Status(Status &&other) = default;
     
     void serialize(DataStream &s) const override {
         s << view << replicaID;
+        s << htole((uint32_t)pvss_transcript.size()) << pvss_transcript;
         s << *qc;
     }
 
     void unserialize(DataStream &s) override {
+        uint32_t n;
+
         s >> view;
         s >> replicaID;
+
+        s >> n;
+        n = letoh(n);
+        auto base = s.get_data_inplace(n);
+        pvss_transcript = bytearray_t(base, base + n);
 
         qc = hsc->parse_quorum_cert(s);
     }
@@ -919,7 +974,7 @@ struct Echo: public Serializable {
     uint32_t mtype;
     uint256_t merkle_root;
     bytearray_t merkle_proof;
-
+    uint256_t blk_hash;
     part_cert_bt cert;
     /** chunk being proposed */
     chunk_t chunk;
@@ -933,6 +988,7 @@ struct Echo: public Serializable {
          uint32_t mtype,
          uint256_t merkle_root,
         bytearray_t merkle_proof,
+         const uint256_t &blk_hash,
          const chunk_t &chunk,
          part_cert_bt &&cert,
          HotStuffCore *hsc):
@@ -941,6 +997,7 @@ struct Echo: public Serializable {
             mtype(mtype),
             merkle_root(merkle_root),
             merkle_proof(merkle_proof),
+            blk_hash(blk_hash),
             chunk(chunk),
             cert(std::move(cert)),
             hsc(hsc){}
@@ -952,12 +1009,13 @@ struct Echo: public Serializable {
             mtype(other.mtype),
             merkle_root(other.merkle_root),
             merkle_proof(other.merkle_proof),
+            blk_hash(other.blk_hash),
             chunk(other.chunk),
             cert(other.cert ? other.cert->clone() : nullptr),
             hsc(other.hsc){}
 
     void serialize(DataStream &s) const override {
-        s << replicaID << idx << view << mtype << merkle_root;
+        s << replicaID << idx << view << mtype << merkle_root << blk_hash;
         s << htole((uint32_t)merkle_proof.size()) << merkle_proof;
         s << *chunk << *cert;
     }
@@ -968,6 +1026,7 @@ struct Echo: public Serializable {
         s >> view;
         s >> mtype;
         s >> merkle_root;
+        s >> blk_hash;
 
         uint32_t n;
         s >> n;
@@ -1002,6 +1061,109 @@ struct Echo: public Serializable {
     operator std::string () const {
         DataStream s;
         s << "<echo "
+          << "rid=" << std::to_string(replicaID) << " "
+          << "idx=" << std::to_string(idx) << " "
+          << "view=" << std::to_string(view) << " "
+          << "mtype=" << std::to_string(mtype) << " "
+          << "hash=" << get_hex10(merkle_root) << ">";
+        return std::move(s);
+    }
+};
+
+struct Echo2: public Serializable {
+    ReplicaID replicaID;
+    uint32_t idx;
+    uint32_t view;
+    uint32_t mtype;
+    uint256_t merkle_root;
+    bytearray_t merkle_proof;
+    uint256_t blk_hash;
+    part_cert_bt cert;
+    /** chunk being proposed */
+    chunk_t chunk;
+
+    HotStuffCore *hsc;
+
+    Echo2(): chunk(nullptr), hsc(nullptr) {}
+    Echo2(ReplicaID replicaID,
+         uint32_t idx,
+         uint32_t view,
+         uint32_t mtype,
+         uint256_t merkle_root,
+         bytearray_t merkle_proof,
+         const uint256_t &blk_hash,
+         const chunk_t &chunk,
+         part_cert_bt &&cert,
+         HotStuffCore *hsc):
+            replicaID(replicaID),
+            idx(idx), view(view),
+            mtype(mtype),
+            merkle_root(merkle_root),
+            merkle_proof(merkle_proof),
+            blk_hash(blk_hash),
+            chunk(chunk),
+            cert(std::move(cert)),
+            hsc(hsc){}
+
+    Echo2(const Echo2 &other):
+            replicaID(other.replicaID),
+            idx(other.idx),
+            view(other.view),
+            mtype(other.mtype),
+            merkle_root(other.merkle_root),
+            merkle_proof(other.merkle_proof),
+            blk_hash(other.blk_hash),
+            chunk(other.chunk),
+            cert(other.cert ? other.cert->clone() : nullptr),
+            hsc(other.hsc){}
+
+    void serialize(DataStream &s) const override {
+        s << replicaID << idx << view << mtype << merkle_root << blk_hash;
+        s << htole((uint32_t)merkle_proof.size()) << merkle_proof;
+        s << *chunk << *cert;
+    }
+
+    inline void unserialize(DataStream &s) override {
+        s >> replicaID;
+        s >> idx;
+        s >> view;
+        s >> mtype;
+        s >> merkle_root;
+        s >> blk_hash;
+
+        uint32_t n;
+        s >> n;
+        n = letoh(n);
+        if (n == 0){
+            merkle_proof.clear();
+        }else{
+            auto base = s.get_data_inplace(n);
+            merkle_proof = bytearray_t(base, base+n);
+        }
+        Chunk _chunk;
+        s >> _chunk;
+        chunk = new Chunk(std::move(_chunk));
+        cert = hsc->parse_part_cert(s);
+    }
+
+
+    bool verify() const {
+        merkle::Hash root(merkle_root);
+        merkle::Path path(merkle_proof);
+
+        return path.verify(root);
+    }
+
+    promise_t verify(VeriPool &vpool) const {
+        assert(hsc != nullptr);
+        return cert->verify(hsc->get_config().get_pubkey(replicaID), vpool).then([this](bool result) {
+            return result && cert->get_obj_hash() == merkle_root; //  &&verify();
+        });
+    }
+
+    operator std::string () const {
+        DataStream s;
+        s << "<echo2 "
           << "rid=" << std::to_string(replicaID) << " "
           << "idx=" << std::to_string(idx) << " "
           << "view=" << std::to_string(view) << " "
@@ -1082,6 +1244,202 @@ struct Beacon: public Serializable {
         return std::move(s);
     }
 };
+
+
+struct NewStateReq: public Serializable {
+    ReplicaID replicaID;
+
+    NewStateReq() {}
+    NewStateReq(ReplicaID replicaID):
+            replicaID(replicaID){}
+
+    NewStateReq(const NewStateReq &other):
+            replicaID(other.replicaID) {}
+
+    NewStateReq(NewStateReq &&other) = default;
+
+    void serialize(DataStream &s) const override {
+        s << replicaID;
+    }
+
+    void unserialize(DataStream &s) override {
+        s >> replicaID;
+    }
+
+    bool verify() const {
+
+        return true;
+    }
+
+    promise_t verify(VeriPool &vpool) const {
+        return promise_t([](promise_t &pm){ pm.resolve(true); });
+    }
+
+    operator std::string () const {
+        DataStream s;
+        s << "<new-state-req "
+          << "rid=" << std::to_string(replicaID) << ">";
+        return std::move(s);
+    }
+};
+
+struct NewStateResp: public Serializable {
+    ReplicaID replicaID;
+    uint32_t view;
+    std::vector<ReplicaID> active_replicas;
+    std::vector<size_t> active_indices;
+    bytearray_t pvss_transcript;
+
+    NewStateResp() {}
+    NewStateResp(ReplicaID replicaID, uint32_t view, const std::vector<ReplicaID> &active_replicas, std::vector<size_t> &active_indices, bytearray_t &&pvss_transcript):
+            replicaID(replicaID), view(view), active_replicas(active_replicas), active_indices(active_indices), pvss_transcript(std::move(pvss_transcript)){}
+
+    NewStateResp(const NewStateResp &other):
+            replicaID(other.replicaID),
+            view(other.view),
+            active_replicas(other.active_replicas),
+            active_indices(active_indices),
+            pvss_transcript(std::move(other.pvss_transcript)){}
+
+    NewStateResp(NewStateResp &&other) = default;
+
+    void serialize(DataStream &s) const override {
+        s << replicaID;
+        s << view;
+        s << htole((uint32_t)active_replicas.size());
+        for (auto rep: active_replicas)
+            s << rep;
+
+        s << htole((uint32_t)active_indices.size());
+        for (auto aid: active_indices)
+            s << aid;
+
+        s << htole((uint32_t)pvss_transcript.size()) << pvss_transcript;
+    }
+
+    void unserialize(DataStream &s) override {
+        uint32_t n;
+        s >> replicaID >> view;
+        s >> n;
+        n = letoh(n);
+        active_replicas.resize(n);
+        for (auto &rep: active_replicas)
+            s >> rep;
+
+        s >> n;
+        n = letoh(n);
+        active_indices.resize(n);
+        for (auto &aid: active_indices)
+            s >> aid;
+
+        s >> n;
+        n = letoh(n);
+        auto base = s.get_data_inplace(n);
+        pvss_transcript = bytearray_t(base, base + n);
+    }
+
+    bool verify() const {
+        return true;
+    }
+
+    promise_t verify(VeriPool &vpool) const {
+        return promise_t([](promise_t &pm){ pm.resolve(true); });
+    }
+
+    operator std::string () const {
+        DataStream s;
+        s << "<new-state-resp "
+          << "rid=" << std::to_string(replicaID) << ">";
+        return std::move(s);
+    }
+};
+
+
+struct Join: public Serializable {
+    ReplicaID replicaID;
+
+    bytearray_t agg_transcript;
+
+    Join() {}
+    Join(ReplicaID replicaID, bytearray_t &&agg_transcript):
+    replicaID(replicaID), agg_transcript(std::move(agg_transcript)) {}
+
+    Join(const Join &other):
+            replicaID(other.replicaID),
+            agg_transcript(std::move(other.agg_transcript)){}
+
+    Join(Join &&other) = default;
+
+    void serialize(DataStream &s) const override {
+        s << replicaID;
+        s << htole((uint32_t)agg_transcript.size()) << agg_transcript;
+    }
+
+    void unserialize(DataStream &s) override {
+        uint32_t n;
+        s >> replicaID;
+        s >> n;
+        n = letoh(n);
+        auto base = s.get_data_inplace(n);
+        agg_transcript = bytearray_t(base, base + n);
+    }
+
+    bool verify() const {
+        return true;
+    }
+
+    promise_t verify(VeriPool &vpool) const {
+        return promise_t([](promise_t &pm){ pm.resolve(true); });
+    }
+
+    operator std::string () const {
+        DataStream s;
+        s << "<join "
+          << "rid=" << std::to_string(replicaID) << ">";
+        return std::move(s);
+    }
+};
+
+struct JoinSuccess: public Serializable {
+    ReplicaID replicaID;
+    uint32_t view;
+
+    JoinSuccess() {}
+    JoinSuccess(ReplicaID replicaID, uint32_t view):
+            replicaID(replicaID), view(view) {}
+
+    JoinSuccess(const JoinSuccess &other):
+            replicaID(other.replicaID),
+            view(other.view){}
+
+    JoinSuccess(JoinSuccess &&other) = default;
+
+    void serialize(DataStream &s) const override {
+        s << replicaID << view;
+    }
+
+    void unserialize(DataStream &s) override {
+        s >> replicaID;
+        s >> view;
+    }
+
+    bool verify() const {
+        return true;
+    }
+
+    promise_t verify(VeriPool &vpool) const {
+        return promise_t([](promise_t &pm){ pm.resolve(true); });
+    }
+
+    operator std::string () const {
+        DataStream s;
+        s << "<join-success "
+          << "rid=" << std::to_string(replicaID) << ">";
+        return std::move(s);
+    }
+};
+
+
 
 
 
